@@ -10,11 +10,11 @@ include $(TOPDIR)/rules.mk
 PKG_ARCH_quickstart:=$(ARCH)
 
 PKG_NAME:=quickstart
-PKG_VERSION:=0.9.6
+PKG_VERSION:=0.10.3
 PKG_RELEASE:=1
 PKG_SOURCE:=$(PKG_NAME)-binary-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://github.com/linkease/istore-packages/releases/download/prebuilt/
-PKG_HASH:=5c4d191d81651338f6560bbf78f5f2bb5729ba293844dfe24d3a41bd7aca6e8d
+PKG_HASH:=b6fd09b8f71a0c56758c9819102268fdf464fe70ca0d6e7f83c5e75e024dee94
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-binary-$(PKG_VERSION)
 
@@ -47,6 +47,7 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 		chmod 755 /etc/uci-defaults/09-quickstart
 		/etc/uci-defaults/09-quickstart && rm -f /etc/uci-defaults/09-quickstart
 	fi
+	exit 0
 fi
 endef
 
