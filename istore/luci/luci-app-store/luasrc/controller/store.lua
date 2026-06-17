@@ -23,10 +23,15 @@ function index()
     entry({"admin", "store", "log"}, call("store_log"))
     entry({"admin", "store", "uid"}, call("action_user_id"))
     entry({"admin", "store", "upload"}, post("store_upload"))
+    entry({"admin", "store", "del_record"}, post("store_del_record"))
+    entry({"admin", "store", "unrun"}, post("store_unrun"))
+    entry({"admin", "store", "run_records"}, call("store_run_records"))
+
     entry({"admin", "store", "check_self_upgrade"}, call("check_self_upgrade"))
     entry({"admin", "store", "do_self_upgrade"}, post("do_self_upgrade"))
     entry({"admin", "store", "toggle_docker"}, post("toggle_docker"))
     entry({"admin", "store", "toggle_arch"}, post("toggle_arch"))
+    entry({"admin", "store", "toggle_ipv4"}, post("toggle_ipv4"))
     entry({"admin", "store", "get_block_devices"}, call("get_block_devices"))
 
     entry({"admin", "store", "configured"}, call("configured"))
@@ -89,6 +94,7 @@ local function user_config()
     local data = {
         hide_docker = uci:get("istore", "istore", "hide_docker") == "1",
         ignore_arch = uci:get("istore", "istore", "ignore_arch") == "1",
+        ipv4 = uci:get("istore", "istore", "ipv4") == "1",
         last_path = uci:get("istore", "istore", "last_path"),
         super_arch = uci:get("istore", "istore", "super_arch"),
         channel = uci:get("istore", "istore", "channel")
@@ -160,6 +166,11 @@ end
 function store_index()
     local fs   = require "nixio.fs"
     local features = { "_lua_force_array_" }
+    if fs.access("/etc/apk/arch") then
+        features[#features+1] = "apk"
+    else
+        features[#features+1] = "opkg"
+    end
     if fs.access("/usr/libexec/istore/backup") then
         features[#features+1] = "backup"
     end
@@ -245,13 +256,11 @@ function validate_pkgname(val)
 end
 
 local function get_installed_and_cache()
-    local metadir = "/usr/lib/opkg/meta"
+    local metadir = "/tmp/run/istore-meta/meta"
     local cachedir = "/tmp/cache/istore"
     local cachefile = cachedir .. "/installed.json"
-    local metapkgpre = "app-meta-"
     local nixio = require "nixio"
     local fs   = require "nixio.fs"
-    local ipkg = require "luci.model.ipkg"
     local jsonc = require "luci.jsonc"
     local result = {}
     local lock, msg = flock("/var/lock/istore-installed.lock", "lock")
@@ -260,6 +269,7 @@ local function get_installed_and_cache()
     if not ms then
         result = {}
     elseif not cs or ms["mtime"] > cs["mtime"] then
+        local cacheable = true
         local itr = fs.dir(metadir)
         local data = {}
         if itr then
@@ -267,7 +277,8 @@ local function get_installed_and_cache()
             local pkg
             for pkg in itr do
                 if pkg:match("^.*%.json$") then
-                    local metadata = fs.readfile(metadir .. "/" .. pkg)
+                    local metafile = metadir .. "/" .. pkg
+                    local metadata = fs.readfile(metafile)
                     if metadata ~= nil then
                         local meta = jsonc.parse(metadata)
                         if meta == nil then
@@ -283,10 +294,15 @@ local function get_installed_and_cache()
                                 broken = true,
                             }
                         end
-                        local metapkg = metapkgpre .. meta.name
-                        local status = ipkg.status(metapkg)
-                        if next(status) ~= nil then
-                            meta.time = tonumber(status[metapkg]["Installed-Time"])
+                        local time = nil
+                        local istat = fs.stat(metafile)
+                        if istat ~= nil then
+                            time = istat["mtime"]
+                        else
+                            cacheable = false
+                        end
+                        if time ~= nil then
+                            meta.time = tonumber(time)
                             data[#data+1] = meta
                         end
                     end
@@ -294,11 +310,13 @@ local function get_installed_and_cache()
             end
         end
         result = data
-        fs.mkdirr(cachedir)
-        local oflags = nixio.open_flags("rdwr", "creat")
-        local mfile, code, msg = nixio.open(cachefile, oflags)
-        mfile:writeall(jsonc.stringify(result))
-        mfile:close()
+        if cacheable then
+            fs.mkdirr(cachedir)
+            local oflags = nixio.open_flags("wronly", "creat", "trunc")
+            local mfile, code, msg = nixio.open(cachefile, oflags)
+            mfile:writeall(jsonc.stringify(result))
+            mfile:close()
+        end
     else
         result = jsonc.parse(fs.readfile(cachefile) or "")
     end
@@ -308,11 +326,10 @@ local function get_installed_and_cache()
 end
 
 function store_action(param)
-    local metadir = "/usr/lib/opkg/meta"
+    local metadir = "/tmp/run/istore-meta/meta"
     local metapkgpre = "app-meta-"
     local code, out, err, ret
     local fs = require "nixio.fs"
-    local ipkg = require "luci.model.ipkg"
     local jsonc = require "luci.jsonc"
     local json_parse = jsonc.parse
     local action = param.action or ""
@@ -323,18 +340,22 @@ function store_action(param)
             luci.http.status(400, "Bad Request")
             return
         end
-        local metapkg = metapkgpre .. pkg
         local meta = {}
-        local metadata = fs.readfile(metadir .. "/" .. pkg .. ".json")
+        local metafile = metadir .. "/" .. pkg .. ".json"
+        local metadata = fs.readfile(metafile)
 
         if metadata ~= nil then
             meta = json_parse(metadata) or {}
         end
         meta.installed = false
-        local status = ipkg.status(metapkg)
-        if next(status) ~= nil then
+        local time = nil
+        local istat = fs.stat(metafile)
+        if istat ~= nil then
+            time = istat["mtime"]
+        end
+        if time ~= nil then
             meta.installed=true
-            meta.time=tonumber(status[metapkg]["Installed-Time"])
+            meta.time=tonumber(time)
         end
 
         ret = meta
@@ -435,11 +456,7 @@ function store_upload()
     local code, out, err
     out = ""
     if finished then
-        if string.lower(string.sub(path, -4, -1)) == ".run" then
-            code, out, err = _action("sh", "-c", "ls -l \"%s\"; md5sum \"%s\" 2>/dev/null; chmod 755 \"%s\" && \"%s\"; RET=$?; rm -f \"%s\"; exit $RET" %{ path, path, path, path, path })
-        else
-            code, out, err = _action("sh", "-c", "opkg install \"%s\"; RET=$?; rm -f \"%s\"; exit $RET" %{ path, path })
-        end
+        code, out, err = _action(myopkg, "dotrun", path)
     else
         code = 500
         err = "upload failed!"
@@ -452,6 +469,46 @@ function store_upload()
     }
     luci.http.prepare_content("application/json")
     luci.http.write_json(ret)
+end
+
+function store_unrun()
+    local record_id = luci.http.formvalue("id")
+    if record_id == nil or record_id == "" then
+        luci.http.status(400, "Bad Request")
+        return
+    end
+    local code, out, err = _action(myopkg, "unrun", record_id)
+    local ret = {
+        code = code,
+        stdout = out,
+        stderr = err
+    }
+    luci.http.prepare_content("application/json")
+    luci.http.write_json(ret)
+end
+
+function store_run_records()
+	local util  = require "luci.util"
+	local run_records = util.exec(myopkg .. " run_records")
+    luci.http.prepare_content("application/json")
+    luci.http.write("{\n\"code\":200,\n\"records\":")
+    luci.http.write(run_records)
+    luci.http.write("\n}\n")
+end
+
+function store_del_record()
+    local nixio = require "nixio"
+    local os   = require "os"
+    local rshift  = nixio.bit.rshift
+
+    local record_id = luci.http.formvalue("id")
+    if record_id == nil or record_id == "" then
+        luci.http.status(400, "Bad Request")
+        return
+    end
+    local r = os.execute(myopkg.." del_record "..luci.util.shellquote(record_id).." >/dev/null 2>&1")
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({code=rshift(r,8)})
 end
 
 function configured()
@@ -516,7 +573,7 @@ function entrysh()
                         errors[#errors+1] = {app=meta.name, code=500, msg="json parse failed: " .. o}
                     else
                         results[#results+1] = status
-                        local oflags = nixio.open_flags("rdwr", "creat")
+                        local oflags = nixio.open_flags("wronly", "creat", "trunc")
                         local mfile, code, msg = nixio.open(cachefile, oflags)
                         mfile:writeall(jsonc.stringify(status))
                         mfile:close()
@@ -982,6 +1039,15 @@ function toggle_arch()
     local uci  = require "luci.model.uci".cursor()
     local ignore = luci.http.formvalue("ignore")
     uci:set("istore", "istore", "ignore_arch", ignore == "true" and "1" or "0")
+    uci:commit("istore")
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({code = 200, msg = "Success"})
+end
+
+function toggle_ipv4()
+    local uci  = require "luci.model.uci".cursor()
+    local ipv4 = luci.http.formvalue("ipv4")
+    uci:set("istore", "istore", "ipv4", ipv4 == "true" and "1" or "0")
     uci:commit("istore")
     luci.http.prepare_content("application/json")
     luci.http.write_json({code = 200, msg = "Success"})
